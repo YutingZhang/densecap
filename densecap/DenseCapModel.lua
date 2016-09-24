@@ -2,6 +2,7 @@ require 'torch'
 require 'nn'
 require 'nngraph'
 
+require 'mattorch'
 require 'densecap.LanguageModel'
 require 'densecap.LocalizationLayer'
 require 'densecap.modules.BoxRegressionCriterion'
@@ -141,7 +142,6 @@ function DenseCapModel:_buildRecognitionNet()
 
   local lm_input = {pos_roi_codes, gt_labels}
   local lm_output = self.nets.language_model(lm_input)
-
   -- Annotate nodes
   roi_codes:annotate{name='recog_base'}
   objectness_scores:annotate{name='objectness_branch'}
@@ -251,7 +251,7 @@ function DenseCapModel:updateOutput(input)
     self._called_forward = true
   end
   self.output = self.net:forward(input)
-
+  temp = self.output[5]
   -- At test-time, apply NMS to final boxes
   local verbose = false
   if verbose then
@@ -259,11 +259,16 @@ function DenseCapModel:updateOutput(input)
     print(string.format('Using NMS threshold of %f', self.opt.final_nms_thresh))
   end
   if not self.train and self.opt.final_nms_thresh > 0 then
+  	local temp = self.output[5]
     -- We need to apply the same NMS mask to the final boxes, their
     -- objectness scores, and the output from the language model
     local final_boxes_float = self.output[4]:float()
     local class_scores_float = self.output[1]:float()
-    local lm_output_float = self.output[5]:float()
+    local lm_output_float = self.output[5][1]:float()
+    local probs_output_float = nil
+    if self.nets.language_model.ground_truth_table ~= nil then
+	  probs_output_float = self.output[5][2]:float()
+    end
     local boxes_scores = torch.FloatTensor(final_boxes_float:size(1), 5)
     local boxes_x1y1x2y2 = box_utils.xcycwh_to_x1y1x2y2(final_boxes_float)
     boxes_scores[{{}, {1, 4}}]:copy(boxes_x1y1x2y2)
@@ -271,13 +276,17 @@ function DenseCapModel:updateOutput(input)
     local idx = box_utils.nms(boxes_scores, self.opt.final_nms_thresh)
     self.output[4] = final_boxes_float:index(1, idx):typeAs(self.output[4])
     self.output[1] = class_scores_float:index(1, idx):typeAs(self.output[1])
-    self.output[5] = lm_output_float:index(1, idx):typeAs(self.output[5])
-
+    --table.insert(self.output, probs_output_float:index(1, idx):typeAs(self.output[5][2]))
+    self.output[5] = lm_output_float:index(1, idx):typeAs(temp[1])
+    if self.nets.language_model.ground_truth_table ~= nil then
+      self.output[6] = probs_output_float:index(1, idx):typeAs(temp[2])
+    else
+      self.output[6] = nil
+    end
+    self.output[7] = lm_output_float
     -- TODO: In the old StnDetectionModel we also applied NMS to the
     -- variables dumped by the LocalizationLayer. Do we want to do that?
   end
-
-
   return self.output
 end
 
@@ -316,14 +325,20 @@ Returns:
   those boxes.
 - captions: Array of length N giving output captions, decoded as strings.
 --]]
-function DenseCapModel:forward_test(input)
+function DenseCapModel:forward_test(input, gt_table, generateGTCaption)
   self:evaluate()
+  self.nets.language_model.ground_truth_table = gt_table
+  self.nets.localization_layer:setTestOption(enerateGTCaption)
   local output = self:forward(input)
   local final_boxes = output[4]
   local objectness_scores = output[1]
   local captions = output[5]
+  local probs = output[6]
   local captions = self.nets.language_model:decodeSequence(captions)
-  return final_boxes, objectness_scores, captions
+  local full_captions = output[7]
+  local full_captions = self.nets.language_model:decodeSequence(full_captions)
+  utils.write_json('gen_gt_desc.json', full_captions)
+  return final_boxes, objectness_scores, captions, probs
 end
 
 

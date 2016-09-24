@@ -131,7 +131,12 @@ function LM:updateOutput(input)
       self.output = self:beamsearch(image_vectors, self.beam_size)
       return self.output
     else
-      return self:sample(image_vectors)
+      if self.ground_truth_table ~= nil then
+        return {self:sample(image_vectors), self:retrival_scores(image_vectors)}
+      else
+        return {self:sample(image_vectors), nil}
+      end
+      --return self:sample(image_vectors)
     end
   end
 end
@@ -208,7 +213,6 @@ function LM:beamsearch(image_vectors, beam_size)
     local start = torch.LongTensor(1, 1):fill(self.START_TOKEN)
     local start_vec = self.lookup_table:forward(start)
     local scores = self.rnn:forward(start_vec):view(1, -1)
-
     -- Initialize our beams to the words with the highest logprobs
     local beams = seq.new(beam_size, T):fill(1)
     local all_logprobs = lsm:forward(scores)
@@ -289,12 +293,92 @@ function LM:beamsearch(image_vectors, beam_size)
   return seq
 end
 
+function LM:retrival_scores(image_vectors)
+  local N = image_vectors:size(1)
+  local softmax = nn.SoftMax():type(image_vectors:type())
+  local gt_desc = {}
+  local num_regs = 0
+  for _, s in pairs(self.ground_truth_table) do
+	local gt_words = {}
+	local count = 0
+	for word in s:gmatch("%w+") do 
+	  table.insert(gt_words, word) 
+	  count = count + 1
+	end
+	gt_words['count'] = count
+	table.insert(gt_desc, gt_words)
+  	num_regs = num_regs + 1
+  end
+  local reg_probs = torch.Tensor(N, num_regs):fill(0)
+  -- During sampling we want our LSTM modules to remember states
+  for i = 1, #self.rnn do
+    local layer = self.rnn:get(i)
+    if torch.isTypeOf(layer, nn.LSTM) then
+      layer:resetStates()
+      layer.remember_states = true
+    end
+  end
+
+  -- Reset view sizes
+  self.view_in:resetSize(N, -1)
+  self.view_out:resetSize(N, 1, -1)
+
+  -- First timestep: image vectors, ignore output
+  local image_vecs_encoded = self.image_encoder:forward(image_vectors)
+  self.rnn:forward(image_vecs_encoded)
+  --get token_to_idx
+  local token_to_idx = {}
+  for idx, token in pairs(self.idx_to_token) do
+    token_to_idx[token] = idx
+  end
+  -- Now feed words through RNN
+  for r = 1, num_regs do
+    for t = 0, gt_desc[r]['count'] do
+      local words = nil
+      if t == 0 then
+        -- On the first timestep, feed START tokens
+        words = torch.LongTensor(N, 1):fill(self.START_TOKEN)
+      else
+        -- On subsequent timesteps, feed previously sampled words
+        if token_to_idx[gt_desc[r][t]] == nil then
+          words = torch.LongTensor(N, 1):fill(token_to_idx['<UNK>'])
+        else
+		  words = torch.LongTensor(N, 1):fill(token_to_idx[gt_desc[r][t]]) 
+      	end
+      end
+      local next_word = nil
+      if t == gt_desc[r]['count'] then
+        next_word = self.END_TOKEN
+      else
+	    if token_to_idx[gt_desc[r][t + 1]] == nil then
+	      next_word = token_to_idx['<UNK>']
+	    else
+	      next_word = token_to_idx[gt_desc[r][t + 1]]
+	    end
+	  end
+      local wordvecs = self.lookup_table:forward(words)
+      local scores = self.rnn:forward(wordvecs):view(N, -1)
+	  local probs = softmax:forward(scores)
+	  reg_probs:sub(1, N, r, r):copy(torch.add(reg_probs:sub(1, N, r, r), torch.log(probs:sub(1, N, next_word, next_word):double())))
+    end
+  end
+  -- After sampling stop remembering states
+  for i = 1, #self.rnn do
+    local layer = self.rnn:get(i)
+    if torch.isTypeOf(layer, nn.LSTM) then
+      layer:resetStates()
+      layer.remember_states = false
+    end
+  end
+
+  return reg_probs
+end
+  
 
 function LM:sample(image_vectors)
-  local N, T = image_vectors:size(1), self.seq_length
+  local N, T, V = image_vectors:size(1), self.seq_length, self.vocab_size
   local seq = torch.LongTensor(N, T):zero()
   local softmax = nn.SoftMax():type(image_vectors:type())
-  
   -- During sampling we want our LSTM modules to remember states
   for i = 1, #self.rnn do
     local layer = self.rnn:get(i)
@@ -325,10 +409,10 @@ function LM:sample(image_vectors)
     local wordvecs = self.lookup_table:forward(words)
     local scores = self.rnn:forward(wordvecs):view(N, -1)
     local idx = nil
+	local probs = softmax:forward(scores)
     if self.sample_argmax then
       _, idx = torch.max(scores, 2)
     else
-      local probs = softmax:forward(scores)
       idx = torch.multinomial(probs, 1):view(-1):long()
     end
     seq[{{}, t}]:copy(idx)

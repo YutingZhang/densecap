@@ -2,6 +2,8 @@ require 'torch'
 require 'nn'
 require 'image'
 
+require 'mattorch'
+package.path = './?.lua;'..package.path
 require 'densecap.DenseCapModel'
 local utils = require 'densecap.utils'
 local box_utils = require 'densecap.box_utils'
@@ -54,14 +56,17 @@ cmd:option('-output_dir', '')
 cmd:option('-output_vis', 1,
   'if 1 then writes files needed for pretty vis into vis/ ')
 cmd:option('-output_vis_dir', 'vis/data')
-
+cmd:option('-output_index', '')
+cmd:option('-gtDescFile', '')
+cmd:option('-save_probs', 'y')
+cmd:option('-generateGTCaption', 'n')
 -- Misc
 cmd:option('-gpu', 0)
-cmd:option('-use_cudnn', 1)
+cmd:option('-use_cudnn', 0)
 local opt = cmd:parse(arg)
 
 
-function run_image(model, img_path, opt, dtype)
+function run_image(model, img_path, opt, dtype, gt_table)
 
   -- Load, resize, and preprocess image
   local img = image.load(img_path, 3)
@@ -74,9 +79,11 @@ function run_image(model, img_path, opt, dtype)
   img_caffe:add(-1, vgg_mean)
 
   -- Run the model forward
-  local boxes, scores, captions = model:forward_test(img_caffe:type(dtype))
+  local boxes, scores, captions, probs= model:forward_test(img_caffe:type(dtype), gt_table, opt.generateGTCaption == 'y')
   local boxes_xywh = box_utils.xcycwh_to_xywh(boxes)
-
+  if opt.save_probs == 'y' and opt.output_index ~= 'cnn' then
+	mattorch.save('retrival_scores_' .. opt.output_index .. '.mat', probs)  
+  end
   local out = {
     img = img,
     boxes = boxes_xywh,
@@ -141,10 +148,13 @@ function get_input_images(opt)
   return image_paths
 end
 
+--local tempt = utils.read_json('../VGG-Crepe/image2regions.json')
+--print(tempt)
 -- Load the model, and cast to the right type
 local dtype, use_cudnn = utils.setup_gpus(opt.gpu, opt.use_cudnn)
 local checkpoint = torch.load(opt.checkpoint)
 local model = checkpoint.model
+--utils.write_json('./tokens.json', model.nets.language_model.idx_to_token)
 model:convert(dtype, use_cudnn)
 model:setTestArgs{
   rpn_nms_thresh = opt.rpn_nms_thresh,
@@ -159,9 +169,15 @@ local num_process = math.min(#image_paths, opt.max_images)
 local results_json = {}
 for k=1,num_process do
   local img_path = image_paths[k]
+  if string.sub(opt.output_index, 1, 3) == 'cnn' then
+  	ground_truth_table = nil
+  else
+	ground_truth_table = utils.read_json(opt.gtDescFile) 
+  end
   print(string.format('%d/%d processing image %s', k, num_process, img_path))
   -- run the model on the image and obtain results
-  local result = run_image(model, img_path, opt, dtype)  
+  local result = run_image(model, img_path, opt, dtype, ground_truth_table)
+  mattorch.save('bbs_' .. opt.output_index .. '.mat', result['boxes']:double())
   -- handle output serialization: either to directory or for pretty html vis
   if opt.output_dir ~= '' then
     local img_out = lua_render_result(result, opt)

@@ -1,5 +1,6 @@
 require 'torch'
 require 'nn'
+require 'mattorch'
 
 require 'densecap.modules.OurCrossEntropyCriterion'
 require 'densecap.modules.BilinearRoiPooling'
@@ -237,6 +238,9 @@ function layer:setTestArgs(args)
   self.test_max_proposals = utils.getopt(args, 'max_proposals', 300)
 end
 
+function layer:setTestOption(gtOrNot)
+  self.generateGTCaption = gtOrNot
+end
 
 function layer:updateOutput(input)
   if self.train then
@@ -343,11 +347,17 @@ function layer:_forward_test(input)
 
   -- Use roi pooling to get features for boxes
   local roi_features
+  self.nets.roi_pooling:setImageSize(self.image_height, self.image_width)
+  if self.generateGTCaption then
+    ground_boxes = box_utils.xywh_to_xcycwh(ground_boxes):cuda()
+    local ground_boxes = mattorch.load('gt_boxes_-1.mat')['x']
+	rpn_boxes_nms:sub(1, ground_boxes:size()[1], 1, 4):copy(ground_boxes)
+    print('generate caption for ground truth')
+  end
   self:timeit('roi_pooling:forward_test', function()
     self.nets.roi_pooling:setImageSize(self.image_height, self.image_width)
     roi_features = self.nets.roi_pooling:forward{cnn_features[1], rpn_boxes_nms}
   end)
-  
   if self.dump_vars then
     local vars = self.stats.vars or {}
     vars.test_rpn_boxes_nms = rpn_boxes_nms
